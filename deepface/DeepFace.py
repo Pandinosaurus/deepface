@@ -1,829 +1,1163 @@
-import warnings
-warnings.filterwarnings("ignore")
-
+# common dependencies
 import os
-#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
-import time
-from os import path
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-import pickle
-
-from deepface.basemodels import VGGFace, OpenFace, Facenet, Facenet512, FbDeepFace, DeepID, DlibWrapper, ArcFace, SFace, Boosting
-from deepface.extendedmodels import Age, Gender, Race, Emotion
-from deepface.commons import functions, realtime, distance as dst
-
-import tensorflow as tf
-tf_version = int(tf.__version__.split(".")[0])
-if tf_version == 2:
-	import logging
-	tf.get_logger().setLevel(logging.ERROR)
-
-def build_model(model_name):
-
-	"""
-	This function builds a deepface model
-	Parameters:
-		model_name (string): face recognition or facial attribute model
-			VGG-Face, Facenet, OpenFace, DeepFace, DeepID for face recognition
-			Age, Gender, Emotion, Race for facial attributes
-
-	Returns:
-		built deepface model
-	"""
-
-	global model_obj #singleton design pattern
-
-	models = {
-		'VGG-Face': VGGFace.loadModel,
-		'OpenFace': OpenFace.loadModel,
-		'Facenet': Facenet.loadModel,
-		'Facenet512': Facenet512.loadModel,
-		'DeepFace': FbDeepFace.loadModel,
-		'DeepID': DeepID.loadModel,
-		'Dlib': DlibWrapper.loadModel,
-		'ArcFace': ArcFace.loadModel,
-		'SFace': SFace.load_model,
-		'Emotion': Emotion.loadModel,
-		'Age': Age.loadModel,
-		'Gender': Gender.loadModel,
-		'Race': Race.loadModel
-	}
-
-	if not "model_obj" in globals():
-		model_obj = {}
-
-	if not model_name in model_obj.keys():
-		model = models.get(model_name)
-		if model:
-			model = model()
-			model_obj[model_name] = model
-			#print(model_name," built")
-		else:
-			raise ValueError('Invalid model_name passed - {}'.format(model_name))
-
-	return model_obj[model_name]
-
-def verify(img1_path, img2_path = '', model_name = 'VGG-Face', distance_metric = 'cosine', model = None, enforce_detection = True, detector_backend = 'opencv', align = True, prog_bar = True, normalization = 'base'):
-
-	"""
-	This function verifies an image pair is same person or different persons.
-
-	Parameters:
-		img1_path, img2_path: exact image path, numpy array (BGR) or based64 encoded images could be passed. If you are going to call verify function for a list of image pairs, then you should pass an array instead of calling the function in for loops.
-
-		e.g. img1_path = [
-			['img1.jpg', 'img2.jpg'],
-			['img2.jpg', 'img3.jpg']
-		]
-
-		model_name (string): VGG-Face, Facenet, OpenFace, DeepFace, DeepID, Dlib, ArcFace or Ensemble
-
-		distance_metric (string): cosine, euclidean, euclidean_l2
-
-		model: Built deepface model. A face recognition model is built every call of verify function. You can pass pre-built face recognition model optionally if you will call verify function several times.
-
-			model = DeepFace.build_model('VGG-Face')
-
-		enforce_detection (boolean): If any face could not be detected in an image, then verify function will return exception. Set this to False not to have this exception. This might be convenient for low resolution images.
-
-		detector_backend (string): set face detector backend as retinaface, mtcnn, opencv, ssd or dlib
-
-		prog_bar (boolean): enable/disable a progress bar
-
-	Returns:
-		Verify function returns a dictionary. If img1_path is a list of image pairs, then the function will return list of dictionary.
-
-		{
-			"verified": True
-			, "distance": 0.2563
-			, "max_threshold_to_verify": 0.40
-			, "model": "VGG-Face"
-			, "similarity_metric": "cosine"
-		}
-
-	"""
-
-	tic = time.time()
-
-	img_list, bulkProcess = functions.initialize_input(img1_path, img2_path)
-
-	resp_objects = []
-
-	#--------------------------------
-
-	if model_name == 'Ensemble':
-		model_names = ["VGG-Face", "Facenet", "OpenFace", "DeepFace"]
-		metrics = ["cosine", "euclidean", "euclidean_l2"]
-	else:
-		model_names = []; metrics = []
-		model_names.append(model_name)
-		metrics.append(distance_metric)
-
-	#--------------------------------
-
-	if model == None:
-		if model_name == 'Ensemble':
-			models = Boosting.loadModel()
-		else:
-			model = build_model(model_name)
-			models = {}
-			models[model_name] = model
-	else:
-		if model_name == 'Ensemble':
-			Boosting.validate_model(model)
-			models = model.copy()
-		else:
-			models = {}
-			models[model_name] = model
-
-	#------------------------------
-
-	disable_option = (False if len(img_list) > 1 else True) or not prog_bar
-
-	pbar = tqdm(range(0,len(img_list)), desc='Verification', disable = disable_option)
-
-	for index in pbar:
-
-		instance = img_list[index]
-
-		if type(instance) == list and len(instance) >= 2:
-			img1_path = instance[0]; img2_path = instance[1]
-
-			ensemble_features = []
-
-			for i in  model_names:
-				custom_model = models[i]
-
-				#img_path, model_name = 'VGG-Face', model = None, enforce_detection = True, detector_backend = 'mtcnn'
-				img1_representation = represent(img_path = img1_path
-						, model_name = model_name, model = custom_model
-						, enforce_detection = enforce_detection, detector_backend = detector_backend
-						, align = align
-						, normalization = normalization
-						)
-
-				img2_representation = represent(img_path = img2_path
-						, model_name = model_name, model = custom_model
-						, enforce_detection = enforce_detection, detector_backend = detector_backend
-						, align = align
-						, normalization = normalization
-						)
-
-				#----------------------
-				#find distances between embeddings
-
-				for j in metrics:
-
-					if j == 'cosine':
-						distance = dst.findCosineDistance(img1_representation, img2_representation)
-					elif j == 'euclidean':
-						distance = dst.findEuclideanDistance(img1_representation, img2_representation)
-					elif j == 'euclidean_l2':
-						distance = dst.findEuclideanDistance(dst.l2_normalize(img1_representation), dst.l2_normalize(img2_representation))
-					else:
-						raise ValueError("Invalid distance_metric passed - ", distance_metric)
-
-					distance = np.float64(distance) #causes trobule for euclideans in api calls if this is not set (issue #175)
-					#----------------------
-					#decision
-
-					if model_name != 'Ensemble':
-
-						threshold = dst.findThreshold(i, j)
-
-						if distance <= threshold:
-							identified = True
-						else:
-							identified = False
-
-						resp_obj = {
-							"verified": identified
-							, "distance": distance
-							, "threshold": threshold
-							, "model": model_name
-							, "detector_backend": detector_backend
-							, "similarity_metric": distance_metric
-						}
-
-						if bulkProcess == True:
-							resp_objects.append(resp_obj)
-						else:
-							return resp_obj
-
-					else: #Ensemble
-
-						#this returns same with OpenFace - euclidean_l2
-						if i == 'OpenFace' and j == 'euclidean':
-							continue
-						else:
-							ensemble_features.append(distance)
-
-			#----------------------
-
-			if model_name == 'Ensemble':
-
-				boosted_tree = Boosting.build_gbm()
-
-				prediction = boosted_tree.predict(np.expand_dims(np.array(ensemble_features), axis=0))[0]
-
-				verified = np.argmax(prediction) == 1
-				score = prediction[np.argmax(prediction)]
-
-				resp_obj = {
-					"verified": verified
-					, "score": score
-					, "distance": ensemble_features
-					, "model": ["VGG-Face", "Facenet", "OpenFace", "DeepFace"]
-					, "similarity_metric": ["cosine", "euclidean", "euclidean_l2"]
-				}
-
-				if bulkProcess == True:
-					resp_objects.append(resp_obj)
-				else:
-					return resp_obj
-
-			#----------------------
-
-		else:
-			raise ValueError("Invalid arguments passed to verify function: ", instance)
-
-	#-------------------------
-
-	toc = time.time()
-
-	if bulkProcess == True:
-
-		resp_obj = {}
-
-		for i in range(0, len(resp_objects)):
-			resp_item = resp_objects[i]
-			resp_obj["pair_%d" % (i+1)] = resp_item
-
-		return resp_obj
-
-def analyze(img_path, actions = ('emotion', 'age', 'gender', 'race') , models = None, enforce_detection = True, detector_backend = 'opencv', prog_bar = True):
-
-	"""
-	This function analyzes facial attributes including age, gender, emotion and race
-
-	Parameters:
-		img_path: exact image path, numpy array (BGR) or base64 encoded image could be passed. If you are going to analyze lots of images, then set this to list. e.g. img_path = ['img1.jpg', 'img2.jpg']
-
-		actions (tuple): The default is ('age', 'gender', 'emotion', 'race'). You can drop some of those attributes.
-
-		models: (Optional[dict]) facial attribute analysis models are built in every call of analyze function. You can pass pre-built models to speed the function up.
-
-			models = {}
-			models['age'] = DeepFace.build_model('Age')
-			models['gender'] = DeepFace.build_model('Gender')
-			models['emotion'] = DeepFace.build_model('Emotion')
-			models['race'] = DeepFace.build_model('Race')
-
-		enforce_detection (boolean): The function throws exception if a face could not be detected. Set this to True if you don't want to get exception. This might be convenient for low resolution images.
-
-		detector_backend (string): set face detector backend as retinaface, mtcnn, opencv, ssd or dlib.
-
-		prog_bar (boolean): enable/disable a progress bar
-	Returns:
-		The function returns a dictionary. If img_path is a list, then it will return list of dictionary.
-
-		{
-			"region": {'x': 230, 'y': 120, 'w': 36, 'h': 45},
-			"age": 28.66,
-			"gender": "woman",
-			"dominant_emotion": "neutral",
-			"emotion": {
-				'sad': 37.65260875225067,
-				'angry': 0.15512987738475204,
-				'surprise': 0.0022171278033056296,
-				'fear': 1.2489334680140018,
-				'happy': 4.609785228967667,
-				'disgust': 9.698561953541684e-07,
-				'neutral': 56.33133053779602
-			}
-			"dominant_race": "white",
-			"race": {
-				'indian': 0.5480832420289516,
-				'asian': 0.7830780930817127,
-				'latino hispanic': 2.0677512511610985,
-				'black': 0.06337375962175429,
-				'middle eastern': 3.088453598320484,
-				'white': 93.44925880432129
-			}
-		}
-
-	"""
-
-	actions = list(actions)
-	if not models:
-		models = {}
-
-	img_paths, bulkProcess = functions.initialize_input(img_path)
-
-	#---------------------------------
-
-	built_models = list(models.keys())
-
-	#---------------------------------
-
-	#pre-trained models passed but it doesn't exist in actions
-	if len(built_models) > 0:
-		if 'emotion' in built_models and 'emotion' not in actions:
-			actions.append('emotion')
-
-		if 'age' in built_models and 'age' not in actions:
-			actions.append('age')
-
-		if 'gender' in built_models and 'gender' not in actions:
-			actions.append('gender')
-
-		if 'race' in built_models and 'race' not in actions:
-			actions.append('race')
-
-	#---------------------------------
-
-	if 'emotion' in actions and 'emotion' not in built_models:
-		models['emotion'] = build_model('Emotion')
-
-	if 'age' in actions and 'age' not in built_models:
-		models['age'] = build_model('Age')
-
-	if 'gender' in actions and 'gender' not in built_models:
-		models['gender'] = build_model('Gender')
-
-	if 'race' in actions and 'race' not in built_models:
-		models['race'] = build_model('Race')
-
-	#---------------------------------
-
-	resp_objects = []
-
-	disable_option = (False if len(img_paths) > 1 else True) or not prog_bar
-
-	global_pbar = tqdm(range(0,len(img_paths)), desc='Analyzing', disable = disable_option)
-
-	for j in global_pbar:
-		img_path = img_paths[j]
-
-		resp_obj = {}
-
-		disable_option = (False if len(actions) > 1 else True) or not prog_bar
-
-		pbar = tqdm(range(0, len(actions)), desc='Finding actions', disable = disable_option)
-
-		img_224 = None # Set to prevent re-detection
-
-		region = [] # x, y, w, h of the detected face region
-		region_labels = ['x', 'y', 'w', 'h']
-
-		is_region_set = False
-
-		#facial attribute analysis
-		for index in pbar:
-			action = actions[index]
-			pbar.set_description("Action: %s" % (action))
-
-			if action == 'emotion':
-				emotion_labels = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
-				img, region = functions.preprocess_face(img = img_path, target_size = (48, 48), grayscale = True, enforce_detection = enforce_detection, detector_backend = detector_backend, return_region = True)
-
-				emotion_predictions = models['emotion'].predict(img)[0,:]
-
-				sum_of_predictions = emotion_predictions.sum()
-
-				resp_obj["emotion"] = {}
-
-				for i in range(0, len(emotion_labels)):
-					emotion_label = emotion_labels[i]
-					emotion_prediction = 100 * emotion_predictions[i] / sum_of_predictions
-					resp_obj["emotion"][emotion_label] = emotion_prediction
-
-				resp_obj["dominant_emotion"] = emotion_labels[np.argmax(emotion_predictions)]
-
-			elif action == 'age':
-				if img_224 is None:
-					img_224, region = functions.preprocess_face(img = img_path, target_size = (224, 224), grayscale = False, enforce_detection = enforce_detection, detector_backend = detector_backend, return_region = True)
-
-				age_predictions = models['age'].predict(img_224)[0,:]
-				apparent_age = Age.findApparentAge(age_predictions)
-
-				resp_obj["age"] = int(apparent_age) #int cast is for the exception - object of type 'float32' is not JSON serializable
-
-			elif action == 'gender':
-				if img_224 is None:
-					img_224, region = functions.preprocess_face(img = img_path, target_size = (224, 224), grayscale = False, enforce_detection = enforce_detection, detector_backend = detector_backend, return_region = True)
-
-				gender_prediction = models['gender'].predict(img_224)[0,:]
-
-				if np.argmax(gender_prediction) == 0:
-					gender = "Woman"
-				elif np.argmax(gender_prediction) == 1:
-					gender = "Man"
-
-				resp_obj["gender"] = gender
-
-			elif action == 'race':
-				if img_224 is None:
-					img_224, region = functions.preprocess_face(img = img_path, target_size = (224, 224), grayscale = False, enforce_detection = enforce_detection, detector_backend = detector_backend, return_region = True) #just emotion model expects grayscale images
-				race_predictions = models['race'].predict(img_224)[0,:]
-				race_labels = ['asian', 'indian', 'black', 'white', 'middle eastern', 'latino hispanic']
-
-				sum_of_predictions = race_predictions.sum()
-
-				resp_obj["race"] = {}
-				for i in range(0, len(race_labels)):
-					race_label = race_labels[i]
-					race_prediction = 100 * race_predictions[i] / sum_of_predictions
-					resp_obj["race"][race_label] = race_prediction
-
-				resp_obj["dominant_race"] = race_labels[np.argmax(race_predictions)]
-
-			#-----------------------------
-
-			if is_region_set != True:
-				resp_obj["region"] = {}
-				is_region_set = True
-				for i, parameter in enumerate(region_labels):
-					resp_obj["region"][parameter] = int(region[i]) #int cast is for the exception - object of type 'float32' is not JSON serializable
-
-		#---------------------------------
-
-		if bulkProcess == True:
-			resp_objects.append(resp_obj)
-		else:
-			return resp_obj
-
-	if bulkProcess == True:
-
-		resp_obj = {}
-
-		for i in range(0, len(resp_objects)):
-			resp_item = resp_objects[i]
-			resp_obj["instance_%d" % (i+1)] = resp_item
-
-		return resp_obj
-
-def find(img_path, db_path, model_name ='VGG-Face', distance_metric = 'cosine', model = None, enforce_detection = True, detector_backend = 'opencv', align = True, prog_bar = True, normalization = 'base', silent=False):
-
-	"""
-	This function applies verification several times and find an identity in a database
-
-	Parameters:
-		img_path: exact image path, numpy array (BGR) or based64 encoded image. If you are going to find several identities, then you should pass img_path as array instead of calling find function in a for loop. e.g. img_path = ["img1.jpg", "img2.jpg"]
-
-		db_path (string): You should store some .jpg files in a folder and pass the exact folder path to this.
-
-		model_name (string): VGG-Face, Facenet, OpenFace, DeepFace, DeepID, Dlib or Ensemble
-
-		distance_metric (string): cosine, euclidean, euclidean_l2
-
-		model: built deepface model. A face recognition models are built in every call of find function. You can pass pre-built models to speed the function up.
-
-			model = DeepFace.build_model('VGG-Face')
-
-		enforce_detection (boolean): The function throws exception if a face could not be detected. Set this to True if you don't want to get exception. This might be convenient for low resolution images.
-
-		detector_backend (string): set face detector backend as retinaface, mtcnn, opencv, ssd or dlib
-
-		prog_bar (boolean): enable/disable a progress bar
-
-	Returns:
-		This function returns pandas data frame. If a list of images is passed to img_path, then it will return list of pandas data frame.
-	"""
-
-	tic = time.time()
-
-	img_paths, bulkProcess = functions.initialize_input(img_path)
-
-	#-------------------------------
-
-	if os.path.isdir(db_path) == True:
-
-		if model == None:
-
-			if model_name == 'Ensemble':
-				if not silent: print("Ensemble learning enabled")
-				models = Boosting.loadModel()
-
-			else: #model is not ensemble
-				model = build_model(model_name)
-				models = {}
-				models[model_name] = model
-
-		else: #model != None
-			if not silent: print("Already built model is passed")
-
-			if model_name == 'Ensemble':
-				Boosting.validate_model(model)
-				models = model.copy()
-			else:
-				models = {}
-				models[model_name] = model
-
-		#---------------------------------------
-
-		if model_name == 'Ensemble':
-			model_names = ['VGG-Face', 'Facenet', 'OpenFace', 'DeepFace']
-			metric_names = ['cosine', 'euclidean', 'euclidean_l2']
-		elif model_name != 'Ensemble':
-			model_names = []; metric_names = []
-			model_names.append(model_name)
-			metric_names.append(distance_metric)
-
-		#---------------------------------------
-
-		file_name = "representations_%s.pkl" % (model_name)
-		file_name = file_name.replace("-", "_").lower()
-
-		if path.exists(db_path+"/"+file_name):
-
-			if not silent: print("WARNING: Representations for images in ",db_path," folder were previously stored in ", file_name, ". If you added new instances after this file creation, then please delete this file and call find function again. It will create it again.")
-
-			f = open(db_path+'/'+file_name, 'rb')
-			representations = pickle.load(f)
-
-			if not silent: print("There are ", len(representations)," representations found in ",file_name)
-
-		else: #create representation.pkl from scratch
-			employees = []
-
-			for r, d, f in os.walk(db_path): # r=root, d=directories, f = files
-				for file in f:
-					if ('.jpg' in file.lower()) or ('.png' in file.lower()):
-						exact_path = r + "/" + file
-						employees.append(exact_path)
-
-			if len(employees) == 0:
-				raise ValueError("There is no image in ", db_path," folder! Validate .jpg or .png files exist in this path.")
-
-			#------------------------
-			#find representations for db images
-
-			representations = []
-
-			pbar = tqdm(range(0,len(employees)), desc='Finding representations', disable = prog_bar)
-
-			#for employee in employees:
-			for index in pbar:
-				employee = employees[index]
-
-				instance = []
-				instance.append(employee)
-
-				for j in model_names:
-					custom_model = models[j]
-
-					representation = represent(img_path = employee
-						, model_name = model_name, model = custom_model
-						, enforce_detection = enforce_detection, detector_backend = detector_backend
-						, align = align
-						, normalization = normalization
-						)
-
-					instance.append(representation)
-
-				#-------------------------------
-
-				representations.append(instance)
-
-			f = open(db_path+'/'+file_name, "wb")
-			pickle.dump(representations, f)
-			f.close()
-
-			if not silent: print("Representations stored in ",db_path,"/",file_name," file. Please delete this file when you add new identities in your database.")
-
-		#----------------------------
-		#now, we got representations for facial database
-
-		if model_name != 'Ensemble':
-			df = pd.DataFrame(representations, columns = ["identity", "%s_representation" % (model_name)])
-		else: #ensemble learning
-
-			columns = ['identity']
-			[columns.append('%s_representation' % i) for i in model_names]
-
-			df = pd.DataFrame(representations, columns = columns)
-
-		df_base = df.copy() #df will be filtered in each img. we will restore it for the next item.
-
-		resp_obj = []
-
-		global_pbar = tqdm(range(0, len(img_paths)), desc='Analyzing', disable = prog_bar)
-		for j in global_pbar:
-			img_path = img_paths[j]
-
-			#find representation for passed image
-
-			for j in model_names:
-				custom_model = models[j]
-
-				target_representation = represent(img_path = img_path
-					, model_name = model_name, model = custom_model
-					, enforce_detection = enforce_detection, detector_backend = detector_backend
-					, align = align
-					, normalization = normalization
-					)
-
-				for k in metric_names:
-					distances = []
-					for index, instance in df.iterrows():
-						source_representation = instance["%s_representation" % (j)]
-
-						if k == 'cosine':
-							distance = dst.findCosineDistance(source_representation, target_representation)
-						elif k == 'euclidean':
-							distance = dst.findEuclideanDistance(source_representation, target_representation)
-						elif k == 'euclidean_l2':
-							distance = dst.findEuclideanDistance(dst.l2_normalize(source_representation), dst.l2_normalize(target_representation))
-
-						distances.append(distance)
-
-					#---------------------------
-
-					if model_name == 'Ensemble' and j == 'OpenFace' and k == 'euclidean':
-						continue
-					else:
-						df["%s_%s" % (j, k)] = distances
-
-						if model_name != 'Ensemble':
-							threshold = dst.findThreshold(j, k)
-							df = df.drop(columns = ["%s_representation" % (j)])
-							df = df[df["%s_%s" % (j, k)] <= threshold]
-
-							df = df.sort_values(by = ["%s_%s" % (j, k)], ascending=True).reset_index(drop=True)
-
-							resp_obj.append(df)
-							df = df_base.copy() #restore df for the next iteration
-
-			#----------------------------------
-
-			if model_name == 'Ensemble':
-
-				feature_names = []
-				for j in model_names:
-					for k in metric_names:
-						if model_name == 'Ensemble' and j == 'OpenFace' and k == 'euclidean':
-							continue
-						else:
-							feature = '%s_%s' % (j, k)
-							feature_names.append(feature)
-
-				#print(df.head())
-
-				x = df[feature_names].values
-
-				#--------------------------------------
-
-				boosted_tree = Boosting.build_gbm()
-
-				y = boosted_tree.predict(x)
-
-				verified_labels = []; scores = []
-				for i in y:
-					verified = np.argmax(i) == 1
-					score = i[np.argmax(i)]
-
-					verified_labels.append(verified)
-					scores.append(score)
-
-				df['verified'] = verified_labels
-				df['score'] = scores
-
-				df = df[df.verified == True]
-				#df = df[df.score > 0.99] #confidence score
-				df = df.sort_values(by = ["score"], ascending=False).reset_index(drop=True)
-				df = df[['identity', 'verified', 'score']]
-
-				resp_obj.append(df)
-				df = df_base.copy() #restore df for the next iteration
-
-			#----------------------------------
-
-		toc = time.time()
-
-		if not silent: print("find function lasts ",toc-tic," seconds")
-
-		if len(resp_obj) == 1:
-			return resp_obj[0]
-
-		return resp_obj
-
-	else:
-		raise ValueError("Passed db_path does not exist!")
-
-	return None
-
-def represent(img_path, model_name = 'VGG-Face', model = None, enforce_detection = True, detector_backend = 'opencv', align = True, normalization = 'base'):
-
-	"""
-	This function represents facial images as vectors.
-
-	Parameters:
-		img_path: exact image path, numpy array (BGR) or based64 encoded images could be passed.
-
-		model_name (string): VGG-Face, Facenet, OpenFace, DeepFace, DeepID, Dlib, ArcFace.
-
-		model: Built deepface model. A face recognition model is built every call of verify function. You can pass pre-built face recognition model optionally if you will call verify function several times. Consider to pass model if you are going to call represent function in a for loop.
-
-			model = DeepFace.build_model('VGG-Face')
-
-		enforce_detection (boolean): If any face could not be detected in an image, then verify function will return exception. Set this to False not to have this exception. This might be convenient for low resolution images.
-
-		detector_backend (string): set face detector backend as retinaface, mtcnn, opencv, ssd or dlib
-
-		normalization (string): normalize the input image before feeding to model
-
-	Returns:
-		Represent function returns a multidimensional vector. The number of dimensions is changing based on the reference model. E.g. FaceNet returns 128 dimensional vector; VGG-Face returns 2622 dimensional vector.
-	"""
-
-	if model is None:
-		model = build_model(model_name)
-
-	#---------------------------------
-
-	#decide input shape
-	input_shape_x, input_shape_y = functions.find_input_shape(model)
-
-	#detect and align
-	img = functions.preprocess_face(img = img_path
-		, target_size=(input_shape_y, input_shape_x)
-		, enforce_detection = enforce_detection
-		, detector_backend = detector_backend
-		, align = align)
-
-	#---------------------------------
-	#custom normalization
-
-	img = functions.normalize_input(img = img, normalization = normalization)
-
-	#---------------------------------
-
-	#represent
-	embedding = model.predict(img)[0].tolist()
-
-	return embedding
-
-def stream(db_path = '', model_name ='VGG-Face', detector_backend = 'opencv', distance_metric = 'cosine', enable_face_analysis = True, source = 0, time_threshold = 5, frame_threshold = 5):
-
-	"""
-	This function applies real time face recognition and facial attribute analysis
-
-	Parameters:
-		db_path (string): facial database path. You should store some .jpg files in this folder.
-
-		model_name (string): VGG-Face, Facenet, OpenFace, DeepFace, DeepID, Dlib or Ensemble
-
-		detector_backend (string): opencv, ssd, mtcnn, dlib, retinaface
-
-		distance_metric (string): cosine, euclidean, euclidean_l2
-
-		enable_facial_analysis (boolean): Set this to False to just run face recognition
-
-		source: Set this to 0 for access web cam. Otherwise, pass exact video path.
-
-		time_threshold (int): how many second analyzed image will be displayed
-
-		frame_threshold (int): how many frames required to focus on face
-
-	"""
-
-	if time_threshold < 1:
-		raise ValueError("time_threshold must be greater than the value 1 but you passed "+str(time_threshold))
-
-	if frame_threshold < 1:
-		raise ValueError("frame_threshold must be greater than the value 1 but you passed "+str(frame_threshold))
-
-	realtime.analysis(db_path, model_name, detector_backend, distance_metric, enable_face_analysis
-						, source = source, time_threshold = time_threshold, frame_threshold = frame_threshold)
-
-def detectFace(img_path, target_size = (224, 224), detector_backend = 'opencv', enforce_detection = True, align = True):
-
-	"""
-	This function applies pre-processing stages of a face recognition pipeline including detection and alignment
-
-	Parameters:
-		img_path: exact image path, numpy array (BGR) or base64 encoded image
-
-		detector_backend (string): face detection backends are retinaface, mtcnn, opencv, ssd or dlib
-
-	Returns:
-		deteced and aligned face in numpy format
-	"""
-
-	img = functions.preprocess_face(img = img_path, target_size = target_size, detector_backend = detector_backend
-		, enforce_detection = enforce_detection, align = align)[0] #preprocess_face returns (1, 224, 224, 3)
-	return img[:, :, ::-1] #bgr to rgb
-
-#---------------------------
-#main
-
-functions.initialize_folder()
-
-def cli():
-	import fire
-	fire.Fire()
+import warnings
+from typing import (
+    Any,
+    Dict,
+    IO,
+    List,
+    Union,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+    Callable,
+    TYPE_CHECKING,
+)
+
+# this has to be set before importing tensorflow
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+# pylint: disable=wrong-import-position, too-many-positional-arguments
+
+# 3rd party dependencies
+from numpy.typing import NDArray
+
+# package dependencies
+from deepface.commons import backend_utils, package_utils, folder_utils
+from deepface.commons.logger import Logger
+from deepface.modules import (
+    modeling,
+    representation,
+    verification,
+    recognition,
+    demography,
+    detection,
+    streaming,
+    preprocessing,
+    datastore,
+)
+from deepface import __version__
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+logger = Logger()
+
+# -----------------------------------
+# configurations for dependencies
+
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# deepface runs on tensorflow, pytorch or onnxruntime, and it does not import the ones it
+# does not run on. see deepface.commons.backend_utils for the way that is decided.
+backend_engine = backend_utils.get_backend_engine()
+logger.debug(f"deepface will run on {backend_engine}")
+
+if backend_engine == backend_utils.TENSORFLOW:
+    # users should install tf_keras package if they are using tf 2.16 or later versions
+    package_utils.validate_for_keras3()
+    package_utils.configure_tensorflow_logging()
+# -----------------------------------
+
+# create required folders if necessary to store model weights
+folder_utils.initialize_folder()
+
+
+def build_model(model_name: str, task: str = "facial_recognition") -> Any:
+    """
+    This function builds a pre-trained model
+    Args:
+        model_name (str): model identifier
+            - VGG-Face, Facenet, Facenet512, OpenFace, DeepFace, DeepID, Dlib,
+                ArcFace, SFace GhostFaceNet and Buffalo_L for face recognition
+            - Age, Gender, Emotion, Race for facial attributes
+            - opencv, mtcnn, ssd, dlib, retinaface, mediapipe,
+                yolov8n, yolov8m, yolov8l, yolov11n, yolov11s, yolov11m,
+                yolov11l, yolov12n, yolov12s, yolov12m, yolov12l,
+                yunet or centerface for face detectors
+            - Fasnet for spoofing
+        task (str): facial_recognition, facial_attribute, face_detector, spoofing
+            default is facial_recognition
+    Returns:
+        built_model
+    """
+    return modeling.build_model(task=task, model_name=model_name)
+
+
+def verify(
+    img1_path: Union[str, NDArray[Any], IO[bytes], List[float]],
+    img2_path: Union[str, NDArray[Any], IO[bytes], List[float]],
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: Union[str, Callable] = "cosine", # type: ignore[type-arg]
+    enforce_detection: bool = True,
+    align: bool = True,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    silent: bool = False,
+    threshold: Optional[float] = None,
+    anti_spoofing: bool = False,
+) -> Dict[str, Any]:
+    """
+    Verify if an image pair represents the same person or different persons.
+    Args:
+        img1_path (str or np.ndarray or IO[bytes] or List[float]): Path to the first image.
+            Accepts exact image path as a string, numpy array (BGR), a file object that supports
+            at least `.read` and is opened in binary mode, base64 encoded images
+            or pre-calculated embeddings.
+
+        img2_path (str or np.ndarray or IO[bytes] or List[float]): Path to the second image.
+            Accepts exact image path as a string, numpy array (BGR), a file object that supports
+            at least `.read` and is opened in binary mode, base64 encoded images
+            or pre-calculated embeddings.
+
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+
+        distance_metric (string or callable): Metric for measuring similarity. Options:
+            'cosine', 'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+            A custom callable receives two 1D NumPy arrays and returns a scalar distance.
+            An explicit threshold is required when using a custom callable.
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+
+        align (bool): Flag to enable face alignment (default is True).
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base)
+
+        silent (boolean): Suppress or allow some log messages for a quieter analysis process
+            (default is False).
+
+        threshold (float): Specify a threshold to determine whether a pair represents the same
+            person or different individuals. This threshold is used for comparing distances.
+            If left unset, default pre-tuned threshold values will be applied based on the specified
+            model name and distance metric (default is None).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+    Returns:
+        result (dict): A dictionary containing verification results with following keys.
+
+        - 'verified' (bool): Indicates whether the images represent the same person (True)
+            or different persons (False).
+
+        - 'distance' (float): The distance measure between the face vectors.
+            A lower distance indicates higher similarity.
+
+        - 'threshold' (float): The maximum threshold used for verification.
+            If the distance is below this threshold, the images are considered a match.
+
+        - 'confidence' (float): Confidence score indicating the likelihood that the images
+            represent the same person. The score is between 0 and 100, where higher values
+            indicate greater confidence in the verification result.
+
+        - 'model' (str): The chosen face recognition model.
+
+        - 'distance_metric' (str): The chosen similarity metric for measuring distances.
+
+        - 'facial_areas' (dict): Rectangular regions of interest for faces in both images.
+            - 'img1': {'x': int, 'y': int, 'w': int, 'h': int}
+                    Region of interest for the first image.
+            - 'img2': {'x': int, 'y': int, 'w': int, 'h': int}
+                    Region of interest for the second image.
+
+        - 'time' (float): Time taken for the verification process in seconds.
+    """
+
+    return verification.verify(
+        img1_path=img1_path,
+        img2_path=img2_path,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        distance_metric=distance_metric,
+        enforce_detection=enforce_detection,
+        align=align,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        silent=silent,
+        threshold=threshold,
+        anti_spoofing=anti_spoofing,
+    )
+
+
+def analyze(
+    img_path: Union[str, NDArray[Any], IO[bytes], List[str], List[NDArray[Any]], List[IO[bytes]]],
+    actions: Union[Tuple[str, ...], List[str]] = ("emotion", "age", "gender", "race"),
+    enforce_detection: bool = True,
+    detector_backend: str = "opencv",
+    align: bool = True,
+    expand_percentage: int = 0,
+    silent: bool = False,
+    anti_spoofing: bool = False,
+) -> Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    """
+    Analyze facial attributes such as age, gender, emotion, and race in the provided image.
+    Args:
+        img_path (str, np.ndarray, IO[bytes], list): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. If the source image contains multiple faces,
+            the result will include information for each detected face.
+
+        actions (tuple): Attributes to analyze. The default is ('age', 'gender', 'emotion', 'race').
+            You can exclude some of these attributes from the analysis if needed.
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n',  'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+
+        align (boolean): Perform alignment based on the eye positions (default is True).
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        silent (boolean): Suppress or allow some log messages for a quieter analysis process
+            (default is False).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+    Returns:
+        (List[List[Dict[str, Any]]]): A list of analysis results if received batched image,
+                                      explained below.
+
+        (List[Dict[str, Any]]): A list of dictionaries, where each dictionary represents
+           the analysis results for a detected face. Each dictionary in the list contains the
+           following keys:
+
+        - 'region' (dict): Represents the rectangular region of the detected face in the image.
+            - 'x': x-coordinate of the top-left corner of the face.
+            - 'y': y-coordinate of the top-left corner of the face.
+            - 'w': Width of the detected face region.
+            - 'h': Height of the detected face region.
+
+        - 'age' (float): Estimated age of the detected face.
+
+        - 'face_confidence' (float): Confidence score for the detected face.
+            Indicates the reliability of the face detection.
+
+        - 'dominant_gender' (str): The dominant gender in the detected face.
+            Either "Man" or "Woman".
+
+        - 'gender' (dict): Confidence scores for each gender category.
+            - 'Man': Confidence score for the male gender.
+            - 'Woman': Confidence score for the female gender.
+
+        - 'dominant_emotion' (str): The dominant emotion in the detected face.
+            Possible values include "sad," "angry," "surprise," "fear," "happy,"
+            "disgust," and "neutral"
+
+        - 'emotion' (dict): Confidence scores for each emotion category.
+            - 'sad': Confidence score for sadness.
+            - 'angry': Confidence score for anger.
+            - 'surprise': Confidence score for surprise.
+            - 'fear': Confidence score for fear.
+            - 'happy': Confidence score for happiness.
+            - 'disgust': Confidence score for disgust.
+            - 'neutral': Confidence score for neutrality.
+
+        - 'dominant_race' (str): The dominant race in the detected face.
+            Possible values include "indian," "asian," "latino hispanic,"
+            "black," "middle eastern," and "white."
+
+        - 'race' (dict): Confidence scores for each race category.
+            - 'indian': Confidence score for Indian ethnicity.
+            - 'asian': Confidence score for Asian ethnicity.
+            - 'latino hispanic': Confidence score for Latino/Hispanic ethnicity.
+            - 'black': Confidence score for Black ethnicity.
+            - 'middle eastern': Confidence score for Middle Eastern ethnicity.
+            - 'white': Confidence score for White ethnicity.
+    """
+    return demography.analyze(
+        img_path=img_path,
+        actions=actions,
+        enforce_detection=enforce_detection,
+        detector_backend=detector_backend,
+        align=align,
+        expand_percentage=expand_percentage,
+        silent=silent,
+        anti_spoofing=anti_spoofing,
+    )
+
+
+def find(
+    img_path: Union[str, NDArray[Any], IO[bytes]],
+    db_path: str,
+    model_name: str = "VGG-Face",
+    distance_metric: Union[str, Callable] = "cosine", # type: ignore[type-arg]
+    enforce_detection: bool = True,
+    detector_backend: str = "opencv",
+    align: bool = True,
+    similarity_search: bool = False,
+    k: Optional[int] = None,
+    expand_percentage: int = 0,
+    threshold: Optional[float] = None,
+    normalization: str = "base",
+    silent: bool = False,
+    refresh_database: bool = True,
+    anti_spoofing: bool = False,
+    datastore_format: str = "npz",
+    return_type: Optional[str] = None,
+) -> Union[List["pd.DataFrame"], List[List[Dict[str, Any]]]]:
+    """
+    Identify individuals in a database. This is a stateful facial recognition function.
+        Use search function to do it in a stateless way.
+    Args:
+        img_path (str or np.ndarray or IO[bytes]): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. If the source image contains multiple
+            faces, the result will include information for each detected face.
+
+        db_path (string): Path to the folder containing image files. All detected faces
+            in the database will be considered in the decision-making process. Besides a local
+            folder, it can be an S3 location (s3://bucket/prefix) or an FTP location
+            (ftp://user:password@host:port/path). The representations datastore is stored
+            in the same location. S3 credentials and endpoint are resolved by boto3, e.g. with
+            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_ENDPOINT_URL environment variables.
+
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+
+        distance_metric (string or callable): Metric for measuring similarity. Options:
+            'cosine', 'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+            With return_type='pandas', a custom callable receives two 1D NumPy arrays and
+            returns a scalar distance. With return_type='dict', it receives gallery embeddings
+            of shape (N, D) first and query embeddings of shape (M, D) second, and must
+            return a distance matrix of shape (M, N). Rows correspond to query faces;
+            columns correspond to gallery entries. Scalar-only callables such as
+            scipy.spatial.distance.euclidean require return_type='pandas'. An explicit threshold
+            is required for custom callables, as they have no pre-tuned threshold.
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n', 'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        align (boolean): Perform alignment based on the eye positions (default is True).
+
+        similarity_search (boolean): If False, performs identity verification and returns images of
+            the same person. If True, performs similarity search and returns visually similar faces
+            (e.g., celebrity or parental look-alikes). Default is False.
+
+        k (int): Number of top similar faces to retrieve from the database for each detected face.
+            If not specified, all faces within the threshold will be returned (default is None).
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        threshold (float): Specify a threshold to determine whether a pair represents the same
+            person or different individuals. This threshold is used for comparing distances.
+            If left unset, default pre-tuned threshold values will be applied based on the specified
+            model name and distance metric (default is None).
+
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+
+        silent (boolean): Suppress or allow some log messages for a quieter analysis process
+            (default is False).
+
+        refresh_database (boolean): Synchronizes the images representation datastore file with the
+            directory/db files, if set to false, it will ignore any file changes inside the db_path
+            (default is True).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+        datastore_format (str): File format of the representations datastore stored in
+            db_path. Options: npz, feather, parquet (default is npz).
+            feather and parquet require pyarrow to be installed.
+
+        return_type (str): Type of the returned results. Options: 'pandas' returns a list of
+            pandas dataframes, 'dict' returns a list of list of dicts. Default is 'pandas'
+            if pandas is installed, otherwise 'dict'. Setting it to 'pandas' requires
+            pandas to be installed.
+            'dict' is optimized for large databases and source images with many faces.
+
+    Returns:
+        results (List[pd.DataFrame] or List[List[Dict[str, Any]]]):
+            A list of pandas dataframes (if `return_type='pandas'`) or
+            a list of list of dicts (if `return_type='dict'`).
+            Each dataframe or dict corresponds to the identity information for
+            an individual detected in the source image.
+
+            Note: If you have a large database and/or a source photo with many faces,
+            use `return_type='dict'`, as it is optimized for large batch processing.
+            Please pay attention that when using `return_type='dict'`, the function returns
+            a list of list of dicts (not a list of DataFrames),
+            but with the same keys as the columns in the DataFrame.
+
+            The DataFrame columns or dict keys include:
+
+            - 'identity': Identity label of the detected individual.
+
+            - 'target_x', 'target_y', 'target_w', 'target_h': Bounding box coordinates of the
+                    target face in the database.
+
+            - 'source_x', 'source_y', 'source_w', 'source_h': Bounding box coordinates of the
+                    detected face in the source image.
+
+            - 'threshold': threshold to determine a pair whether same person or different persons
+
+            - 'distance': Similarity score between the faces based on the
+                    specified model and distance metric
+
+            - 'confidence': Confidence score indicating the likelihood that the images
+                    represent the same person. The score is between 0 and 100, where higher values
+                    indicate greater confidence in the verification result.
+
+    Example:
+        A custom Euclidean callback that supports both scalar and batched inputs:
+
+        ```python
+        import numpy as np
+        from deepface import DeepFace
+
+        def custom_euclidean(alpha, beta):
+            if alpha.ndim == 1 and beta.ndim == 1:
+                return np.linalg.norm(alpha - beta)
+            return np.linalg.norm(beta[:, None, :] - alpha[None, :, :], axis=2)
+
+        results = DeepFace.find(
+            img_path="img1.jpg",
+            db_path="C:/my_db",
+            distance_metric=custom_euclidean,
+            threshold=10.0,  # Choose a threshold appropriate to your metric and application.
+            return_type="dict",
+        )
+        ```
+    """
+    return recognition.find(
+        img_path=img_path,
+        db_path=db_path,
+        model_name=model_name,
+        distance_metric=distance_metric,
+        enforce_detection=enforce_detection,
+        detector_backend=detector_backend,
+        align=align,
+        similarity_search=similarity_search,
+        k=k,
+        expand_percentage=expand_percentage,
+        threshold=threshold,
+        normalization=normalization,
+        silent=silent,
+        refresh_database=refresh_database,
+        anti_spoofing=anti_spoofing,
+        datastore_format=datastore_format,
+        return_type=return_type,
+    )
+
+
+def represent(
+    img_path: Union[str, NDArray[Any], IO[bytes], Sequence[Union[str, NDArray[Any], IO[bytes]]]],
+    model_name: str = "VGG-Face",
+    enforce_detection: bool = True,
+    detector_backend: str = "opencv",
+    align: bool = True,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    max_faces: Optional[int] = None,
+    l2_normalize: bool = False,
+    minmax_normalize: bool = False,
+    return_face: bool = False,
+) -> Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    """
+    Represent facial images as multi-dimensional vector embeddings.
+
+    Args:
+        img_path (str, np.ndarray, IO[bytes], or Sequence[Union[str, np.ndarray, IO[bytes]]]):
+            The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. If the source image contains multiple faces,
+            the result will include information for each detected face. If a sequence is provided,
+            each element should be a string or numpy array representing an image, and the function
+            will process images in batch.
+
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet
+            (default is VGG-Face.).
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Default is True. Set to False to avoid the exception for low-resolution images
+            (default is True).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n', 'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        align (boolean): Perform alignment based on the eye positions (default is True).
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        normalization (string): Normalize the input image before feeding it to the model.
+            Default is base. Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace
+            (default is base).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+        max_faces (int): Set a limit on the number of faces to be processed (default is None).
+
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+            of the output embeddings
+
+        minmax_normalize (bool): Flag to enable min-max normalization of the output embeddings
+            to the range [0, 1].
+
+        return_face (bool): If True, the detected face images will also be returned along
+            with embeddings. Default is False.
+
+    Returns:
+        results (List[Dict[str, Any]] or List[Dict[str, Any]]): A list of dictionaries.
+            Result type becomes List of List of Dict if batch input passed.
+            Each containing the following fields:
+
+        - embedding (List[float]): Multidimensional vector representing facial features.
+            The number of dimensions varies based on the reference model
+            (e.g., FaceNet returns 128 dimensions, VGG-Face returns 4096 dimensions).
+
+        - facial_area (dict): Detected facial area by face detection in dictionary format.
+            Contains 'x' and 'y' as the left-corner point, and 'w' and 'h'
+            as the width and height. If `detector_backend` is set to 'skip', it represents
+            the full image area and is nonsensical.
+
+        - face_confidence (float): Confidence score of face detection. If `detector_backend` is set
+            to 'skip', the confidence will be 0 and is nonsensical.
+    """
+    return representation.represent(
+        img_path=img_path,
+        model_name=model_name,
+        enforce_detection=enforce_detection,
+        detector_backend=detector_backend,
+        align=align,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        anti_spoofing=anti_spoofing,
+        max_faces=max_faces,
+        l2_normalize=l2_normalize,
+        minmax_normalize=minmax_normalize,
+        return_face=return_face,
+    )
+
+
+def stream(
+    db_path: str = "",
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: str = "cosine",
+    enable_face_analysis: bool = True,
+    source: Any = 0,
+    time_threshold: int = 5,
+    frame_threshold: int = 5,
+    anti_spoofing: bool = False,
+    output_path: Optional[str] = None,
+    debug: bool = False,
+) -> None:
+    """
+    Run real time face recognition and facial attribute analysis
+
+    Args:
+        db_path (string): Path to the folder containing image files. All detected faces
+            in the database will be considered in the decision-making process.
+
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n', 'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+
+        enable_face_analysis (bool): Flag to enable face analysis (default is True).
+
+        source (Any): The source for the video stream (default is 0, which represents the
+            default camera).
+
+        time_threshold (int): The time threshold (in seconds) for face recognition (default is 5).
+
+        frame_threshold (int): The frame threshold for face recognition (default is 5).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+        output_path (str): Path to save the output video. (default is None
+            If None, no video is saved).
+
+        debug (bool): set this to True to save frame outcomes
+
+    Returns:
+        None
+    """
+
+    time_threshold = max(time_threshold, 1)
+    frame_threshold = max(frame_threshold, 1)
+
+    streaming.analysis(
+        db_path=db_path,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        distance_metric=distance_metric,
+        enable_face_analysis=enable_face_analysis,
+        source=source,
+        time_threshold=time_threshold,
+        frame_threshold=frame_threshold,
+        anti_spoofing=anti_spoofing,
+        output_path=output_path,
+        debug=debug,
+    )
+
+
+def extract_faces(
+    img_path: Union[str, NDArray[Any], IO[bytes], List[str], List[NDArray[Any]], List[IO[bytes]]],
+    detector_backend: str = "opencv",
+    enforce_detection: bool = True,
+    align: bool = True,
+    expand_percentage: int = 0,
+    grayscale: bool = False,
+    color_face: str = "rgb",
+    normalize_face: bool = True,
+    anti_spoofing: bool = False,
+) -> Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]]:
+    """
+    Extract faces from a given image
+
+    Args:
+        img_path (str or list of str ornp.ndarray or IO[bytes]): Path to the first image.
+            Accepts exact image path as a string, list of string, numpy array (BGR), a file object
+            that supports at least `.read` and is opened in binary mode, or base64 encoded images.
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n', 'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+
+        align (bool): Flag to enable face alignment (default is True).
+
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+
+        grayscale (boolean): (Deprecated) Flag to convert the output face image to grayscale
+            (default is False).
+
+        color_face (string): Color to return face image output. Options: 'rgb', 'bgr' or 'gray'
+            (default is 'rgb').
+
+        normalize_face (boolean): Flag to enable normalization (divide by 255) of the output
+            face image output face image normalization (default is True).
+
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+
+    Returns:
+        results (List[Dict[str, Any]]): A list of dictionaries, where each dictionary contains:
+
+        - "face" (np.ndarray): The detected face as a NumPy array.
+
+        - "facial_area" (Dict[str, Any]): The detected face's regions as a dictionary containing:
+            - keys 'x', 'y', 'w', 'h' with int values
+            - keys 'left_eye', 'right_eye' with a tuple of 2 ints as values. left and right eyes
+                are eyes on the left and right respectively with respect to the person itself
+                instead of observer.
+
+        - "confidence" (float): The confidence score associated with the detected face.
+
+        - "is_real" (boolean): antispoofing analyze result. this key is just available in the
+            result only if anti_spoofing is set to True in input arguments.
+
+        - "antispoof_score" (float): score of antispoofing analyze result. this key is
+            just available in the result only if anti_spoofing is set to True in input arguments.
+    """
+
+    return detection.extract_faces(
+        img_path=img_path,
+        detector_backend=detector_backend,
+        enforce_detection=enforce_detection,
+        align=align,
+        expand_percentage=expand_percentage,
+        grayscale=grayscale,
+        color_face=color_face,
+        normalize_face=normalize_face,
+        anti_spoofing=anti_spoofing,
+    )
+
+
+def cli() -> None:
+    """
+    command line interface function will be offered in this block
+    """
+    try:
+        import fire  # pylint: disable=import-error
+    except ImportError as import_err:
+        raise ImportError(
+            "fire is required to use deepface from the command line. "
+            'Please run `pip install "deepface[cli]"` to install it.'
+        ) from import_err
+
+    fire.Fire()
+
+
+# deprecated function(s)
+
+
+def detectFace(
+    img_path: Union[str, NDArray[Any], IO[bytes]],
+    target_size: Tuple[int, int] = (224, 224),
+    detector_backend: str = "opencv",
+    enforce_detection: bool = True,
+    align: bool = True,
+) -> Union[NDArray[Any], None]:
+    """
+    Deprecated face detection function. Use extract_faces for same functionality.
+
+    Args:
+        img_path (str or np.ndarray): Path to the first image. Accepts exact image path
+            as a string, numpy array (BGR), or base64 encoded images.
+
+        target_size (tuple): final shape of facial image. black pixels will be
+            added to resize the image (default is (224, 224)).
+
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8', 'yolov11n', 'yolov11s', 'yolov11m',
+            'centerface' or 'skip' (default is opencv).
+
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+
+        align (bool): Flag to enable face alignment (default is True).
+
+    Returns:
+        img (np.ndarray): detected (and aligned) facial area image as numpy array
+    """
+    logger.warn("Function detectFace is deprecated. Use extract_faces instead.")
+    face_objs: List[Dict[str, Any]] = cast(
+        List[Dict[str, Any]],
+        extract_faces(
+            img_path=img_path,
+            detector_backend=detector_backend,
+            grayscale=False,
+            enforce_detection=enforce_detection,
+            align=align,
+        ),
+    )
+    extracted_face = None
+    if len(face_objs) > 0:
+        extracted_face = face_objs[0]["face"]
+        extracted_face = preprocessing.resize_image(img=extracted_face, target_size=target_size)
+    return extracted_face
+
+
+def register(
+    img: Union[str, NDArray[Any], IO[bytes], List[str], List[NDArray[Any]], List[IO[bytes]]],
+    img_name: Optional[str] = None,
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    enforce_detection: bool = True,
+    align: bool = True,
+    l2_normalize: bool = False,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    database_type: str = "postgres",
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    connection: Any = None,
+) -> Dict[str, Any]:
+    """
+    Register identities to database for face recognition
+    Args:
+        img (str or np.ndarray or IO[bytes] or list): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. If a list is provided, each element should be a string
+            or numpy array representing an image, and the function will process images in batch.
+        img_name (optional str): image name to store in db, if not provided then we will try to
+            extract it from given img.
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+        database_type (str): Type of database to register identities. Options: 'postgres', 'mongo',
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant', 'sqlite', 'oracle',
+            'mssql', 'db2', 'redis', 'cassandra', 'mysql' (default is 'postgres').
+        connection_details (dict or str): Connection details for the database.
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+            - DEEPFACE_SQLITE_PATH
+            - DEEPFACE_ORACLE_URI
+            - DEEPFACE_MSSQL_URI
+            - DEEPFACE_DB2_URI
+            - DEEPFACE_REDIS_URI
+            - DEEPFACE_CASSANDRA_URI
+            - DEEPFACE_MYSQL_URI
+
+        Note:
+            For graph databases (neo4j), age, gender, emotion and race of each face are
+            also predicted and stored as properties of the face.
+    Returns:
+        result (dict): A dictionary containing registration results with following keys.
+            - inserted (int): Number of embeddings successfully registered to the database.
+    """
+    return datastore.register(
+        img=img,
+        img_name=img_name,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        enforce_detection=enforce_detection,
+        align=align,
+        l2_normalize=l2_normalize,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        anti_spoofing=anti_spoofing,
+        database_type=database_type,
+        connection_details=connection_details,
+        connection=connection,
+    )
+
+
+def search(
+    img: Union[str, NDArray[Any], IO[bytes], List[str], List[NDArray[Any]], List[IO[bytes]]],
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: str = "cosine",
+    enforce_detection: bool = True,
+    align: bool = True,
+    l2_normalize: bool = False,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    similarity_search: bool = False,
+    k: Optional[int] = None,
+    database_type: str = "postgres",
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    connection: Any = None,
+    search_method: str = "exact",
+    return_type: Optional[str] = None,
+) -> Union[List["pd.DataFrame"], List[List[Dict[str, Any]]]]:
+    """
+    Search for identities in database for face recognition. This is a stateless facial
+        recognition function. Use find function to do it in a stateful way.
+    Args:
+        img (str or np.ndarray or IO[bytes] or list): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. If a list is provided, each element should be a string
+            or numpy array representing an image, and the function will process images in batch.
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'angular' (default is cosine).
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+        similarity_search (boolean): If False, performs identity verification and returns images of
+            the same person. If True, performs similarity search and returns visually similar faces
+            (e.g., celebrity or parental look-alikes). Default is False.
+        k (int): Number of top similar faces to retrieve from the database for each detected face.
+            If not specified, all faces within the threshold will be returned (default is None).
+        search_method (str): Method to use for searching identities. Options: 'exact', 'ann'.
+            To use ann search, you must run build_index function first to create the index.
+        return_type (str): Type of the returned results. Options: 'pandas' returns a list of
+            pandas dataframes, 'dict' returns a list of list of dicts. Default is 'pandas'
+            if pandas is installed, otherwise 'dict'. Setting it to 'pandas' requires
+            pandas to be installed.
+        database_type (str): Type of database to search identities. Options: 'postgres', 'mongo',
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant', 'sqlite', 'oracle',
+            'mssql', 'db2', 'redis', 'cassandra', 'mysql' (default is 'postgres').
+        connection_details (dict or str): Connection details for the database.
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+            - DEEPFACE_SQLITE_PATH
+            - DEEPFACE_ORACLE_URI
+            - DEEPFACE_MSSQL_URI
+            - DEEPFACE_DB2_URI
+            - DEEPFACE_REDIS_URI
+            - DEEPFACE_CASSANDRA_URI
+            - DEEPFACE_MYSQL_URI
+    Returns:
+        results (List[pd.DataFrame] or List[List[Dict[str, Any]]]):
+            A list of pandas dataframes or a list of dicts. Each dataframe or dict corresponds
+                to the identity information for an individual detected in the source image.
+
+            The DataFrame columns or dict keys include:
+            - id: ID of the detected individual.
+            - img_name: Name of the image file in the database.
+            - model_name: Name of the model used for recognition.
+            - aligned: Whether face alignment was performed.
+            - l2_normalized: Whether L2 normalization was applied.
+            - search_method: Method used for searching identities: exact or ann.
+            - confidence: Confidence score indicating the likelihood that the images
+                represent the same person. The score is between 0 and 100, where higher values
+                indicate greater confidence in the verification result.
+            - target_x, target_y, target_w, target_h: Bounding box coordinates of the
+                target face in the database. Notice that source image's face coordinates
+                are not included in the result here.
+            - threshold: threshold to determine a pair whether same person or different persons
+            - distance_metric: Distance metric used for similarity measurement.
+                Distance metric will be ignored for ann search, and set to cosine if l2_normalize
+                is True, euclidean if l2_normalize is False.
+            - distance: Similarity score between the faces based on the specified model
+                and distance metric
+    """
+    return datastore.search(
+        img=img,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        distance_metric=distance_metric,
+        enforce_detection=enforce_detection,
+        align=align,
+        l2_normalize=l2_normalize,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        anti_spoofing=anti_spoofing,
+        similarity_search=similarity_search,
+        k=k,
+        database_type=database_type,
+        connection_details=connection_details,
+        connection=connection,
+        search_method=search_method,
+        return_type=return_type,
+    )
+
+
+def identify(
+    img: Union[str, NDArray[Any], IO[bytes]],
+    identity_id: Union[str, int],
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: str = "cosine",
+    enforce_detection: bool = True,
+    align: bool = True,
+    l2_normalize: bool = False,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    database_type: str = "postgres",
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    connection: Any = None,
+) -> Dict[str, Any]:
+    """
+    Verify given image against a single identity registered in the database.
+
+    While search function compares the given image against all identities in the database
+        in O(n), this function pulls the embedding of the given id only and compares the
+        given image against that identity in O(1).
+
+    Args:
+        img (str or np.ndarray or IO[bytes]): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. This must be a single image, batch of images is
+            not allowed. That single image may still have many faces, then the closest face
+            to the given identity is used.
+        identity_id (str or int): ID of the embedding record in the database to compare
+            the given image against. IDs are returned by the search function.
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+        database_type (str): Type of database storing the identities. Options: 'postgres',
+            'mongo', 'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant', 'sqlite',
+            'oracle', 'mssql', 'db2', 'redis', 'cassandra', 'mysql'
+            (default is 'postgres').
+        connection_details (dict or str): Connection details for the database.
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+            - DEEPFACE_SQLITE_PATH
+            - DEEPFACE_ORACLE_URI
+            - DEEPFACE_MSSQL_URI
+            - DEEPFACE_DB2_URI
+            - DEEPFACE_REDIS_URI
+            - DEEPFACE_CASSANDRA_URI
+            - DEEPFACE_MYSQL_URI
+    Returns:
+        result (dict): A dictionary containing verification results.
+
+        - 'verified' (bool): Indicates whether the given image and the identity in the database
+            represent the same person (True) or different persons (False).
+
+        - 'distance' (float): The distance measure between the face vectors.
+            A lower distance indicates higher similarity.
+
+        - 'threshold' (float): The maximum threshold used for verification.
+            If the distance is below this threshold, the images are considered a match.
+
+        - 'confidence' (float): Confidence score indicating the likelihood that the images
+            represent the same person. The score is between 0 and 100, where higher values
+            indicate greater confidence in the verification result.
+
+        - 'model' (str): The chosen face recognition model.
+
+        - 'detector_backend' (str): The chosen face detector backend.
+
+        - 'similarity_metric' (str): The chosen similarity metric for measuring distances.
+
+        - 'id': ID of the identity in the database.
+
+        - 'img_name' (str): Name of the image file of the identity in the database.
+
+        - 'facial_areas' (dict): Rectangular regions of interest for faces.
+            - 'img1': region of interest for the given image.
+            - 'img2': None, because facial area of the identity is not stored in database.
+
+        - 'time' (float): Time taken for the identification process in seconds.
+    """
+    return datastore.identify(
+        img=img,
+        identity_id=identity_id,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        distance_metric=distance_metric,
+        enforce_detection=enforce_detection,
+        align=align,
+        l2_normalize=l2_normalize,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        anti_spoofing=anti_spoofing,
+        database_type=database_type,
+        connection_details=connection_details,
+        connection=connection,
+    )
+
+
+def build_index(
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    align: bool = True,
+    l2_normalize: bool = False,
+    database_type: str = "postgres",
+    connection: Any = None,
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    max_neighbors_per_node: int = 32,
+) -> None:
+    """
+    Build index for faster search in the database. You should set search_method to 'ann'
+        in the search function to use the built index.
+
+    - Use this function after registering all identities to the database.
+    - This function is resumable, run again whenever new identities are added to the db.
+    - Vector databases handle indexing internally, so you don't need to use this function
+        when using a vector database
+        ('weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant')
+        as database_type.
+
+    Args:
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        max_neighbors_per_node (int): Maximum number of neighbors per node in the index
+            (default is 32).
+        database_type (str): Type of database to build index. Options: 'postgres', 'mongo',
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant', 'sqlite', 'oracle',
+            'mssql', 'db2', 'redis', 'cassandra', 'mysql' (default is 'postgres').
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+        connection_details (dict or str): Connection details for the database.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+            - DEEPFACE_SQLITE_PATH
+            - DEEPFACE_ORACLE_URI
+            - DEEPFACE_MSSQL_URI
+            - DEEPFACE_DB2_URI
+            - DEEPFACE_REDIS_URI
+            - DEEPFACE_CASSANDRA_URI
+            - DEEPFACE_MYSQL_URI
+    """
+    return datastore.build_index(
+        model_name=model_name,
+        detector_backend=detector_backend,
+        l2_normalize=l2_normalize,
+        align=align,
+        database_type=database_type,
+        connection=connection,
+        connection_details=connection_details,
+        max_neighbors_per_node=max_neighbors_per_node,
+    )
